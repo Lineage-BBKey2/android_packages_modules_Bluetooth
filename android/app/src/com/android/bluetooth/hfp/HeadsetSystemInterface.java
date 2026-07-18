@@ -290,7 +290,7 @@ class HeadsetSystemInterface {
     public boolean listCurrentCalls() {
         BluetoothInCallService bluetoothInCallService = getBluetoothInCallServiceInstance();
         if (bluetoothInCallService == null) {
-            Log.e(TAG, "listCurrentCalls() failed: mBluetoothInCallService is null");
+            Log.d(TAG, "listCurrentCalls(): mBluetoothInCallService is null (no active call)");
             return false;
         }
         return bluetoothInCallService.listCurrentCalls();

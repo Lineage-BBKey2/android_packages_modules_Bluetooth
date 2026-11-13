@@ -20,7 +20,9 @@
 #include <bluetooth/log.h>
 #include <com_android_bluetooth_flags.h>
 
+#include <algorithm>
 #include <vector>
+#include "osi/include/properties.h"
 
 #include "a2dp_provider_info.h"
 #include "audio_aidl_interfaces.h"
@@ -243,6 +245,20 @@ uint16_t remote_delay = 0;
 
 bool is_low_latency_mode_allowed = false;
 
+static bool qti_a2dp_offload_enabled() {
+  // The device flag is numeric: the OSI bool reader accepts only "true".
+  return osi_property_get_int32("ro.vendor.audio.qti_a2dp_offload", 0) == 1 &&
+         osi_property_get_bool("ro.bluetooth.a2dp_offload.supported", false) &&
+         !osi_property_get_bool("persist.bluetooth.a2dp_offload.disabled", false);
+}
+
+static uint32_t qti_aac_mtu_bitrate(uint32_t negotiated, uint16_t mtu, uint32_t rate) {
+  if (mtu <= 13 || rate != 48000 || negotiated < 64000) return negotiated;
+  const uint64_t limit = (static_cast<uint64_t>(mtu - 13) * rate / 128) * 70 / 100;
+  if (limit < 64000) return negotiated;
+  return static_cast<uint32_t>(std::min<uint64_t>(negotiated, limit));
+}
+
 bool a2dp_get_selected_hal_codec_config(A2dpCodecConfig* a2dp_config, uint16_t peer_mtu,
                                         CodecConfiguration* codec_config) {
   btav_a2dp_codec_config_t current_codec = a2dp_config->getCodecConfig();
@@ -291,6 +307,13 @@ bool a2dp_get_selected_hal_codec_config(A2dpCodecConfig* a2dp_config, uint16_t p
   }
   codec_config->encodedAudioBitrate = a2dp_config->getTrackBitRate();
   codec_config->peerMtu = peer_mtu;
+  if (qti_a2dp_offload_enabled() && current_codec.codec_type == BTAV_A2DP_CODEC_INDEX_SOURCE_AAC) {
+    const uint32_t original = codec_config->encodedAudioBitrate;
+    codec_config->encodedAudioBitrate = qti_aac_mtu_bitrate(
+            original, peer_mtu, A2dpCodecToHalSampleRate(current_codec));
+    log::info("QTI AAC offload bitrate {} -> {} (MTU {})", original,
+              codec_config->encodedAudioBitrate, peer_mtu);
+  }
   log::info("CodecConfiguration={}", codec_config->toString());
   return true;
 }

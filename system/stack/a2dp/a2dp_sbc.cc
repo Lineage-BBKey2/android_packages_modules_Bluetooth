@@ -45,11 +45,20 @@
 #include "embdrv/sbc/encoder/include/sbc_encoder.h"
 #include "hardware/bt_av.h"
 #include "internal_include/bt_trace.h"
+#include "osi/include/properties.h"
 #include "stack/include/bt_hdr.h"
 
 #define A2DP_SBC_MAX_BITPOOL 53
 
 using namespace bluetooth;
+
+static bool qti_a2dp_offload_enabled() {
+  // The device flag is numeric: the OSI bool reader accepts only "true".
+  return osi_property_get_int32("ro.vendor.audio.qti_a2dp_offload", 0) == 1 &&
+         osi_property_get_bool("ro.bluetooth.a2dp_offload.supported", false) &&
+         !osi_property_get_bool("persist.bluetooth.a2dp_offload.disabled", false);
+}
+
 
 /* data type for the SBC Codec Information Element */
 typedef struct {
@@ -65,7 +74,9 @@ typedef struct {
 
 /* SBC Source codec capabilities */
 static const tA2DP_SBC_CIE a2dp_sbc_source_caps = {
-        (A2DP_SBC_IE_SAMP_FREQ_44),                         /* samp_freq */
+        static_cast<uint8_t>(qti_a2dp_offload_enabled()
+                ? (A2DP_SBC_IE_SAMP_FREQ_44 | A2DP_SBC_IE_SAMP_FREQ_48)
+                : A2DP_SBC_IE_SAMP_FREQ_44), /* samp_freq */
         (A2DP_SBC_IE_CH_MD_MONO | A2DP_SBC_IE_CH_MD_JOINT), /* ch_mode */
         (A2DP_SBC_IE_BLOCKS_16 | A2DP_SBC_IE_BLOCKS_12 | A2DP_SBC_IE_BLOCKS_8 |
          A2DP_SBC_IE_BLOCKS_4),            /* block_len */
@@ -1079,6 +1090,13 @@ tA2DP_STATUS A2dpCodecConfigSbcBase::setCodecConfig(const uint8_t* p_peer_codec_
     }
     if (samp_freq & A2DP_SBC_IE_SAMP_FREQ_48) {
       codec_capability_.sample_rate |= BTAV_A2DP_CODEC_SAMPLE_RATE_48000;
+    }
+
+    // Prefer the DSP's rate only for this device's enabled offload path.
+    if (qti_a2dp_offload_enabled() && (samp_freq & A2DP_SBC_IE_SAMP_FREQ_48)) {
+      result_config_cie.samp_freq = A2DP_SBC_IE_SAMP_FREQ_48;
+      codec_config_.sample_rate = BTAV_A2DP_CODEC_SAMPLE_RATE_48000;
+      break;
     }
 
     // No user preference - try the codec audio config

@@ -63,6 +63,12 @@ using std::unique_ptr;
 static std::recursive_mutex life_cycle_guard;
 static bool life_cycle_stopped = true;
 
+static bool qti_a2dp_zero_opcode_reply_matches(uint8_t sub, size_t size, uint8_t echoed_sub) {
+  const bool known = sub == 0x03 || sub == 0x04 || sub == 0x05 ||
+                     sub == 0x07 || sub == 0x09 || sub == 0x0a;
+  return known && size > 0 && (size == 1 || echoed_sub == sub);
+}
+
 static std::chrono::milliseconds getHciTimeoutMs() {
   static auto sHciTimeoutMs = std::chrono::milliseconds(bluetooth::os::GetSystemPropertyUint32Base(
           "bluetooth.hci.timeout_milliseconds", HciLayer::kHciTimeoutMs.count()));
@@ -218,6 +224,44 @@ struct HciLayer::impl {
     command_credits_ = response_view.GetNumHciCommandPackets();
     OpCode op_code = response_view.GetCommandOpCode();
     if (op_code == OpCode::NONE) {
+      // Only the explicitly enabled QTI A2DP protocol needs this firmware quirk.
+      // An ordinary NOP, unrelated VSC, or malformed success must not consume
+      // the queued command's callback.
+      if (logging_id == "complete" && static_cast<uint16_t>(waiting_command_) == 0xfc0a &&
+          os::GetSystemPropertyUint32Base("ro.vendor.audio.qti_a2dp_offload", 0) == 1 &&
+          !command_queue_.empty() && command_queue_.front().command_view != nullptr &&
+          command_queue_.front().waiting_for_ == CommandQueueEntry::WaitingFor::COMPLETE) {
+        auto complete = CommandCompleteView::Create(event);
+        // Validation belongs to each view instance, not to the shared event bytes.
+        log::assert_that(complete.IsValid(), "assert failed: complete.IsValid()");
+        auto sent = command_queue_.front().command_view->GetPayload();
+        auto params = complete.GetPayload();
+        if (sent.size() > 0 && params.size() > 0) {
+          const uint8_t sub = sent[0];
+          // This firmware acknowledges legacy STOP(05 00) with opcode zero
+          // and return bytes 00 02. Match only that captured success shape.
+          const bool legacy_stop_reply = sent.size() == 2 && sub == 0x05 && sent[1] == 0 &&
+                                         params.size() == 2 && params[0] == 0 && params[1] == 0x02;
+          if (legacy_stop_reply || qti_a2dp_zero_opcode_reply_matches(
+                      sub, params.size(), params.size() > 1 ? params[1] : 0)) {
+            auto payload = std::make_unique<packet::RawBuilder>();
+            for (size_t i = 0; i < params.size(); ++i) {
+              // The upper callback tracks the queued QTI subcommand (05).
+              payload->AddOctets1(legacy_stop_reply && i == 1 ? sub : params[i]);
+            }
+            // A status-only QTI response identifies its command through this
+            // checked queue entry; provide the omitted echo to the BTA callback.
+            if (params.size() == 1) payload->AddOctets1(sub);
+            auto builder = CommandCompleteBuilder::Create(
+                    complete.GetNumHciCommandPackets(), waiting_command_, std::move(payload));
+            auto bytes = std::make_shared<std::vector<uint8_t>>(builder->SerializeToBytes());
+            log::warn("Matching opcode-zero completion to QTI A2DP sub-opcode 0x{:02x}", sub);
+            handle_command_response<CommandCompleteView>(
+                    EventView::Create(PacketView<kLittleEndian>(bytes)), logging_id);
+            return;
+          }
+        }
+      }
       send_next_command();
       return;
     }

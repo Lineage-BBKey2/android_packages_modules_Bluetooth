@@ -30,6 +30,8 @@
 #include <bluetooth/log.h>
 #include <com_android_bluetooth_flags.h>
 
+#include <algorithm>
+#include <deque>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -3025,6 +3027,294 @@ void bta_av_open_at_inc(tBTA_AV_SCB* p_scb, tBTA_AV_DATA* p_data) {
   }
 }
 
+/*
+ * QTI split-A2DP vendor command set.
+ *
+ * The WCN399x firmware some devices ship with predates the Google A2DP
+ * offload command (HCI_CONTROLLER_A2DP) and answers it with Unknown HCI
+ * Command. Its own protocol is a short sequence of sub-commands on
+ * VSC 0xFC0A, each acknowledged by a command complete event carrying
+ * [status, sub_opcode]:
+ *
+ *   SELECTED_CODEC -> TRANSPORT_CONFIGURATION -> WRITE_A2DP_MEDIA_CHANNEL_CFG
+ *   -> START_A2DP_MEDIA, and STOP_A2DP_MEDIA to tear down.
+ *
+ * The encoded stream still reaches the controller from the audio DSP, so the
+ * rest of the offload path (audio HAL session, encoder setup) is unchanged.
+ * Enabled per device with ro.vendor.audio.qti_a2dp_offload=1.
+ */
+#define HCI_QTI_A2DP (HCI_VSQC_CONTROLLER_A2DP_OPCODE | HCI_GRP_VENDOR_SPECIFIC)
+#define VS_QHCI_WRITE_A2DP_MEDIA_CHANNEL_CFG 0x03
+#define VS_QHCI_START_A2DP_MEDIA 0x04
+#define VS_QHCI_STOP_A2DP_MEDIA 0x05
+#define VS_QHCI_A2DP_TRANSPORT_CONFIGURATION 0x07
+#define VS_QHCI_A2DP_SELECTED_CODEC 0x09
+#define VS_QHCI_A2DP_OFFLOAD_START 0x0A
+#define VS_QHCI_OFFLOAD_START_LEN 66
+#define VS_QHCI_TTP_MS 150
+#define VS_QHCI_TRANSPORT_SLIMBUS 0x00
+#define VS_QHCI_MAX_A2DP_MTU 1008
+
+/* Codec identifiers as the QTI firmware numbers them. */
+#define VS_QHCI_CODEC_SBC 0x00
+#define VS_QHCI_CODEC_AAC 0x02
+#define VS_QHCI_CODEC_LDAC 0x04
+#define VS_QHCI_CODEC_APTX 0x08
+#define VS_QHCI_CODEC_APTX_HD 0x09
+
+struct QtiOffloadRequest {
+  uint64_t epoch;
+  uint8_t sub_opcode;
+};
+
+static struct {
+  uint8_t codec_type;
+  uint16_t acl_hdl;
+  uint16_t l2c_rcid;
+  uint16_t mtu;
+  /* SELECTED_CODEC, prepared up front for the multi-command fallback. */
+  uint8_t select_cmd[16];
+  uint8_t select_len;
+  uint64_t epoch;
+  std::deque<QtiOffloadRequest> requests;
+} qti_offload;
+
+/*
+ * Newer QTI firmware starts the stream with one OFFLOAD_START command, as the
+ * Android 11 QTI stack does; older firmware rejects it and takes the chain.
+ * persist.bluetooth.a2dp_offload.qti_single_vsc=false skips the single command.
+ */
+static bool bta_av_qti_single_vsc_enabled() {
+  return osi_property_get_bool("persist.bluetooth.a2dp_offload.qti_single_vsc", true);
+}
+
+static uint16_t bta_av_qti_rate_mask(int sample_rate) {
+  switch (sample_rate) {
+    case 16000:
+      return 0x40;
+    case 24000:
+      return 0x80;
+    case 44100:
+      return 0x01;
+    case 48000:
+      return 0x02;
+    case 88200:
+      return 0x04;
+    case 96000:
+      return 0x08;
+    default:
+      return 0x01;
+  }
+}
+
+static bool qti_a2dp_offload_enabled() {
+  // The device flag is numeric: the OSI bool reader accepts only "true".
+  return osi_property_get_int32("ro.vendor.audio.qti_a2dp_offload", 0) == 1 &&
+         osi_property_get_bool("ro.bluetooth.a2dp_offload.supported", false) &&
+         !osi_property_get_bool("persist.bluetooth.a2dp_offload.disabled", false);
+}
+
+static void bta_av_qti_offload_callback(tBTM_VSC_CMPL* param);
+
+static void bta_av_qti_offload_send(uint8_t* param, uint8_t len) {
+  qti_offload.requests.push_back({qti_offload.epoch, param[0]});
+  log::verbose("sub-opcode 0x{:02x} len {}", param[0], len);
+  get_btm_client_interface().vendor.BTM_VendorSpecificCommand(HCI_QTI_A2DP, len, param,
+                                                              bta_av_qti_offload_callback);
+}
+
+static void bta_av_qti_offload_callback(tBTM_VSC_CMPL* param) {
+  if (qti_offload.requests.empty()) {
+    log::warn("QTI offload response without a pending request");
+    return;
+  }
+  const auto request = qti_offload.requests.front();
+  qti_offload.requests.pop_front();
+  if (request.epoch != qti_offload.epoch) {
+    // The stream was stopped or replaced while this command was queued.
+    return;
+  }
+  const bool has_status = param != nullptr && param->p_param_buf != nullptr && param->param_len > 0;
+  uint8_t status = has_status ? param->p_param_buf[0] : 1;
+  if (status == 0 && (param->param_len < 2 || param->p_param_buf[1] != request.sub_opcode)) {
+    log::error("Malformed QTI offload response for sub-opcode 0x{:02x}", request.sub_opcode);
+    status = 1;
+  }
+  const uint8_t sub_opcode = request.sub_opcode;
+  if (status != 0 && sub_opcode == VS_QHCI_A2DP_OFFLOAD_START) {
+    log::info("QTI single start failed ({}), trying legacy command chain", status);
+    bta_av_qti_offload_send(qti_offload.select_cmd, qti_offload.select_len);
+    return;
+  }
+  tBTA_AV value{0};
+  if (status != 0) {
+    if (sub_opcode == VS_QHCI_STOP_A2DP_MEDIA) return;
+    log::error("QTI offload sub-opcode 0x{:02x} failed: {}", sub_opcode, status);
+    bta_av_cb.offload_start_pending_hndl = BTA_AV_INVALID_HANDLE;
+    value.status = status;
+    (*bta_av_cb.p_cback)(BTA_AV_OFFLOAD_START_RSP_EVT, &value);
+    return;
+  }
+  uint8_t cmd[16];
+  uint8_t* p = cmd;
+  switch (sub_opcode) {
+    case VS_QHCI_A2DP_SELECTED_CODEC:
+      UINT8_TO_STREAM(p, VS_QHCI_A2DP_TRANSPORT_CONFIGURATION);
+      UINT8_TO_STREAM(p, VS_QHCI_TRANSPORT_SLIMBUS);
+      UINT8_TO_STREAM(p, qti_offload.codec_type);
+      bta_av_qti_offload_send(cmd, p - cmd);
+      break;
+    case VS_QHCI_A2DP_TRANSPORT_CONFIGURATION:
+      UINT8_TO_STREAM(p, VS_QHCI_WRITE_A2DP_MEDIA_CHANNEL_CFG);
+      UINT8_TO_STREAM(p, 0);
+      UINT16_TO_STREAM(p, qti_offload.acl_hdl);
+      UINT16_TO_STREAM(p, qti_offload.l2c_rcid);
+      UINT16_TO_STREAM(p, qti_offload.mtu);
+      bta_av_qti_offload_send(cmd, p - cmd);
+      break;
+    case VS_QHCI_WRITE_A2DP_MEDIA_CHANNEL_CFG:
+      UINT8_TO_STREAM(p, VS_QHCI_START_A2DP_MEDIA);
+      UINT8_TO_STREAM(p, 0);
+      bta_av_qti_offload_send(cmd, p - cmd);
+      break;
+    case VS_QHCI_A2DP_OFFLOAD_START:
+    case VS_QHCI_START_A2DP_MEDIA:
+      if (bta_av_cb.offload_start_pending_hndl) {
+        bta_av_cb.offload_started_hndl = bta_av_cb.offload_start_pending_hndl;
+        bta_av_cb.offload_start_pending_hndl = BTA_AV_INVALID_HANDLE;
+        (*bta_av_cb.p_cback)(BTA_AV_OFFLOAD_START_RSP_EVT, &value);
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+static void bta_av_qti_offload_start(tBTA_AV_SCB* p_scb, const tBT_A2DP_OFFLOAD* offload_start) {
+  const char* codec_name = A2DP_CodecName(p_scb->cfg.codec_info);
+  const int sample_rate = A2DP_GetTrackSampleRate(p_scb->cfg.codec_info);
+  uint8_t* p = qti_offload.select_cmd;
+
+  if (strcmp(codec_name, "SBC") == 0) {
+    qti_offload.codec_type = VS_QHCI_CODEC_SBC;
+  } else if (strcmp(codec_name, "AAC") == 0) {
+    qti_offload.codec_type = VS_QHCI_CODEC_AAC;
+  } else if (strcmp(codec_name, "aptX") == 0) {
+    qti_offload.codec_type = VS_QHCI_CODEC_APTX;
+  } else if (strcmp(codec_name, "aptX-HD") == 0) {
+    qti_offload.codec_type = VS_QHCI_CODEC_APTX_HD;
+  } else {
+    tBTA_AV value{0};
+    log::error("codec {} has no QTI offload identifier", codec_name);
+    value.status = BTA_AV_FAIL;
+    (*bta_av_cb.p_cback)(BTA_AV_OFFLOAD_START_RSP_EVT, &value);
+    return;
+  }
+  // The packaged SDM660 ADSP configuration is restricted to 48 kHz.
+  if (sample_rate != 48000) {
+    tBTA_AV value{0};
+    value.status = BTA_AV_FAIL;
+    (*bta_av_cb.p_cback)(BTA_AV_OFFLOAD_START_RSP_EVT, &value);
+    return;
+  }
+  ++qti_offload.epoch;
+  qti_offload.acl_hdl = offload_start->acl_hdl;
+  qti_offload.l2c_rcid = offload_start->l2c_rcid;
+  /*
+   * The QTI firmware takes the AVDTP MTU including the media header, as the
+   * Oreo QTI stack computed it: stream MTU, limited for middle-quality SBC,
+   * plus the header, capped at the 3-DH5 payload.
+   */
+  qti_offload.mtu = p_scb->stream_mtu;
+  /* As the QTI stack: a peer that is EDR but cannot do 3 Mbps gets packets
+   * that fit a 2-DH5, and so do the aptX family and LDAC. */
+  if (btif_av_is_peer_edr(p_scb->PeerAddress(), A2dpType::kSource) &&
+      !btif_av_peer_supports_3mbps(p_scb->PeerAddress(), A2dpType::kSource) &&
+      qti_offload.mtu > MAX_2MBPS_AVDTP_MTU) {
+    log::warn("peer is EDR without 3 Mbps, restricting AVDTP MTU to {}", MAX_2MBPS_AVDTP_MTU);
+    qti_offload.mtu = std::min<uint16_t>(qti_offload.mtu, MAX_2MBPS_AVDTP_MTU);
+  }
+  if (qti_offload.codec_type == VS_QHCI_CODEC_SBC &&
+      A2DP_GetMaxBitpoolSbc(p_scb->cfg.codec_info) <= A2DP_SBC_BITPOOL_MIDDLE_QUALITY) {
+    qti_offload.mtu = std::min<uint16_t>(qti_offload.mtu, MAX_2MBPS_AVDTP_MTU);
+  }
+  if ((qti_offload.codec_type == VS_QHCI_CODEC_APTX ||
+       qti_offload.codec_type == VS_QHCI_CODEC_APTX_HD ||
+       qti_offload.codec_type == VS_QHCI_CODEC_LDAC) &&
+      qti_offload.mtu > MAX_2MBPS_AVDTP_MTU) {
+    qti_offload.mtu = std::min<uint16_t>(qti_offload.mtu, MAX_2MBPS_AVDTP_MTU);
+  }
+  qti_offload.mtu = std::min<uint32_t>(static_cast<uint32_t>(qti_offload.mtu) +
+                                      AVDT_MEDIA_HDR_SIZE, VS_QHCI_MAX_A2DP_MTU);
+  /* Some sinks (car kits) negotiate a media MTU just under the 3-DH5 payload;
+   * let the cap be lowered at runtime while that is being characterised. */
+  uint16_t mtu_cap = (uint16_t)osi_property_get_int32(
+          "persist.bluetooth.a2dp_offload.qti_mtu_cap", VS_QHCI_MAX_A2DP_MTU);
+  if (mtu_cap == 0 || mtu_cap > VS_QHCI_MAX_A2DP_MTU) {
+    mtu_cap = VS_QHCI_MAX_A2DP_MTU;
+  }
+  if (qti_offload.mtu > mtu_cap) {
+    qti_offload.mtu = mtu_cap;
+  }
+
+  log::info("codec {} ({}), sample rate {}, ACL 0x{:x}, L2CAP 0x{:x}, MTU {} (stream MTU {}, cap {})",
+            codec_name, qti_offload.codec_type, sample_rate, qti_offload.acl_hdl,
+            qti_offload.l2c_rcid, qti_offload.mtu, p_scb->stream_mtu, mtu_cap);
+
+  UINT8_TO_STREAM(p, VS_QHCI_A2DP_SELECTED_CODEC);
+  UINT8_TO_STREAM(p, qti_offload.codec_type);
+  UINT8_TO_STREAM(p, 0); /* max latency */
+  UINT8_TO_STREAM(p, 0); /* delay reporting */
+  UINT8_TO_STREAM(p, 0); /* content protection active */
+  UINT8_TO_STREAM(p, 0); /* content protection flag */
+  UINT16_TO_STREAM(p, sample_rate);
+  if (qti_offload.codec_type == VS_QHCI_CODEC_SBC) {
+    UINT8_TO_STREAM(p, A2DP_GetNumberOfSubbandsSbc(p_scb->cfg.codec_info));
+    UINT8_TO_STREAM(p, A2DP_GetNumberOfBlocksSbc(p_scb->cfg.codec_info));
+  }
+
+  qti_offload.select_len = p - qti_offload.select_cmd;
+
+  bta_av_cb.offload_start_pending_hndl = p_scb->hndl;
+  bta_av_cb.offload_start_v2 = false;
+
+  if (!bta_av_qti_single_vsc_enabled()) {
+    bta_av_qti_offload_send(qti_offload.select_cmd, qti_offload.select_len);
+    return;
+  }
+
+  uint8_t single[VS_QHCI_OFFLOAD_START_LEN] = {0};
+  uint8_t* q = single;
+  UINT8_TO_STREAM(q, VS_QHCI_A2DP_OFFLOAD_START);
+  UINT8_TO_STREAM(q, qti_offload.codec_type);
+  UINT8_TO_STREAM(q, VS_QHCI_TRANSPORT_SLIMBUS);
+  UINT8_TO_STREAM(q, qti_offload.codec_type); /* stream type */
+  UINT8_TO_STREAM(q, 0);                      /* device index */
+  UINT8_TO_STREAM(q, 0);                      /* max latency */
+  UINT8_TO_STREAM(q, 0);                      /* delay reporting */
+  UINT8_TO_STREAM(q, 0);                      /* content protection active */
+  UINT8_TO_STREAM(q, 0);                      /* content protection flag */
+  UINT16_TO_STREAM(q, bta_av_qti_rate_mask(sample_rate));
+  UINT16_TO_STREAM(q, qti_offload.acl_hdl);
+  UINT16_TO_STREAM(q, qti_offload.l2c_rcid);
+  UINT16_TO_STREAM(q, qti_offload.mtu);
+  UINT8_TO_STREAM(q, 1); /* stream start */
+  UINT8_TO_STREAM(q, 0); /* split ACL, TWS only */
+  UINT8_TO_STREAM(q, 0); /* channel mode, TWS only */
+  UINT16_TO_STREAM(q, VS_QHCI_TTP_MS);
+  ARRAY_TO_STREAM(q, p_scb->cfg.codec_info, AVDT_CODEC_SIZE);
+
+  bta_av_qti_offload_send(single, sizeof(single));
+}
+
+static void bta_av_qti_offload_stop() {
+  ++qti_offload.epoch;
+  uint8_t cmd[2] = {VS_QHCI_STOP_A2DP_MEDIA, 0};
+
+  bta_av_qti_offload_send(cmd, sizeof(cmd));
+}
+
+
 static void offload_vendor_callback(tBTM_VSC_CMPL* param) {
   tBTA_AV value{0};
   uint8_t sub_opcode = 0;
@@ -3149,6 +3439,11 @@ void bta_av_vendor_offload_stop() {
 
   log::verbose("");
 
+  if (qti_a2dp_offload_enabled()) {
+    bta_av_qti_offload_stop();
+    return;
+  }
+
   if (bta_av_cb.offload_start_v2) {
     tBTA_AV_SCB* p_scb = bta_av_hndl_to_scb(bta_av_cb.offload_start_pending_hndl);
     if (p_scb == nullptr) {
@@ -3205,6 +3500,10 @@ void bta_av_offload_req(tBTA_AV_SCB* p_scb, tBTA_AV_DATA* /*p_data*/) {
     status = BTA_AV_FAIL_STREAM;
   } else if (bta_av_cb.offload_start_pending_hndl || bta_av_cb.offload_started_hndl) {
     log::warn("offload already started, ignore request");
+    return;
+  } else if (qti_a2dp_offload_enabled()) {
+    bta_av_offload_codec_builder(p_scb, &offload_start);
+    bta_av_qti_offload_start(p_scb, &offload_start);
     return;
   } else if (::bluetooth::audio::a2dp::provider::supports_codec(codec_config->codecIndex())) {
     bta_av_vendor_offload_start_v2(p_scb, static_cast<A2dpCodecConfigExt*>(codec_config));

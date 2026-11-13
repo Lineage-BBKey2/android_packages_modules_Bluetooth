@@ -52,6 +52,14 @@
 
 using namespace bluetooth;
 
+static bool qti_a2dp_offload_enabled() {
+  // The device flag is numeric: the OSI bool reader accepts only "true".
+  return osi_property_get_int32("ro.vendor.audio.qti_a2dp_offload", 0) == 1 &&
+         osi_property_get_bool("ro.bluetooth.a2dp_offload.supported", false) &&
+         !osi_property_get_bool("persist.bluetooth.a2dp_offload.disabled", false);
+}
+
+
 // data type for the AAC Codec Information Element */
 // NOTE: bits_per_sample is needed only for AAC encoder initialization.
 typedef struct {
@@ -71,8 +79,10 @@ static const tA2DP_AAC_CIE a2dp_aac_cbr_source_caps = {
         // objectType
         A2DP_AAC_OBJECT_TYPE_MPEG2_LC,
         // sampleRate
-        // TODO: AAC 48.0kHz sampling rate should be added back - see b/62301376
-        A2DP_AAC_SAMPLING_FREQ_44100,
+        // This device's DSP path needs 48 kHz; retain the software baseline otherwise.
+        static_cast<uint16_t>(qti_a2dp_offload_enabled()
+                ? (A2DP_AAC_SAMPLING_FREQ_44100 | A2DP_AAC_SAMPLING_FREQ_48000)
+                : A2DP_AAC_SAMPLING_FREQ_44100),
         // channelMode
         A2DP_AAC_CHANNEL_MODE_STEREO,
         // variableBitRateSupport
@@ -87,8 +97,10 @@ static const tA2DP_AAC_CIE a2dp_aac_vbr_source_caps = {
         // objectType
         A2DP_AAC_OBJECT_TYPE_MPEG2_LC,
         // sampleRate
-        // TODO: AAC 48.0kHz sampling rate should be added back - see b/62301376
-        A2DP_AAC_SAMPLING_FREQ_44100,
+        // This device's DSP path needs 48 kHz; retain the software baseline otherwise.
+        static_cast<uint16_t>(qti_a2dp_offload_enabled()
+                ? (A2DP_AAC_SAMPLING_FREQ_44100 | A2DP_AAC_SAMPLING_FREQ_48000)
+                : A2DP_AAC_SAMPLING_FREQ_44100),
         // channelMode
         A2DP_AAC_CHANNEL_MODE_STEREO,
         // variableBitRateSupport
@@ -1084,6 +1096,13 @@ tA2DP_STATUS A2dpCodecConfigAacBase::setCodecConfig(const uint8_t* p_peer_codec_
     }
     if (sampleRate & A2DP_AAC_SAMPLING_FREQ_96000) {
       codec_capability_.sample_rate |= BTAV_A2DP_CODEC_SAMPLE_RATE_96000;
+    }
+
+    // Explicit user selections above still take precedence.
+    if (qti_a2dp_offload_enabled() && (sampleRate & A2DP_AAC_SAMPLING_FREQ_48000)) {
+      result_config_cie.sampleRate = A2DP_AAC_SAMPLING_FREQ_48000;
+      codec_config_.sample_rate = BTAV_A2DP_CODEC_SAMPLE_RATE_48000;
+      break;
     }
 
     // No user preference - try the codec audio config

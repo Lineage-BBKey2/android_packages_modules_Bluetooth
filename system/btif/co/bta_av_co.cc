@@ -51,6 +51,7 @@
 #include "include/hardware/bt_av.h"
 #include "os/logging/log_adapter.h"
 #include "osi/include/allocator.h"
+#include "osi/include/properties.h"
 #include "stack/include/a2dp_codec_api.h"
 #include "stack/include/a2dp_constants.h"
 #include "stack/include/a2dp_ext.h"
@@ -70,6 +71,22 @@ const uint8_t bta_av_co_cp_scmst[AVDT_CP_INFO_LEN] = {0x02, 0x02, 0x00};
 // Control block instance
 static const bool kContentProtectEnabled = false;
 static BtaAvCo bta_av_co_cb(kContentProtectEnabled, new BtaAvCoPeerCache());
+
+static bool qti_a2dp_offload_enabled() {
+  // The device flag is numeric: the OSI bool reader accepts only "true".
+  return osi_property_get_int32("ro.vendor.audio.qti_a2dp_offload", 0) == 1 &&
+         osi_property_get_bool("ro.bluetooth.a2dp_offload.supported", false) &&
+         !osi_property_get_bool("persist.bluetooth.a2dp_offload.disabled", false);
+}
+
+static bool qti_rate_reconfig_needed(const uint8_t* info, A2dpCodecConfig* current) {
+  if (!qti_a2dp_offload_enabled()) return false;
+  if (current != nullptr &&
+      current->getCodecUserConfig().sample_rate == BTAV_A2DP_CODEC_SAMPLE_RATE_44100) return false;
+  auto codec = A2DP_SourceCodecIndex(info);
+  return (codec == BTAV_A2DP_CODEC_INDEX_SOURCE_SBC || codec == BTAV_A2DP_CODEC_INDEX_SOURCE_AAC) &&
+         A2DP_GetTrackSampleRate(info) == 44100;
+}
 
 void BtaAvCoState::setActivePeer(BtaAvCoPeer* peer) { active_peer_ = peer; }
 
@@ -299,6 +316,20 @@ tA2DP_STATUS BtaAvCo::ProcessSourceGetConfig(tBTA_AV_HNDL bta_av_handle,
   const BtaAvCoSep* p_sink = nullptr;
   if (p_peer->acceptor) {
     UpdateAllSelectableSourceCodecs(p_peer);
+    if (p_peer->reconfig_needed && qti_rate_reconfig_needed(
+            p_peer->codec_config, p_peer->GetCodecs()->getCurrentCodecConfig())) {
+      uint8_t imposed[AVDT_CODEC_SIZE];
+      memcpy(imposed, p_peer->codec_config, sizeof(imposed));
+      const BtaAvCoSep* previous_sink = p_peer->p_sink;
+      const BtaAvCoSep* selected_sink = SelectSourceCodec(p_peer);
+      if (selected_sink != nullptr && A2DP_GetTrackSampleRate(p_peer->codec_config) == 48000) {
+        log::info("QTI offload: reconfiguring peer {} to 48 kHz", p_peer->addr);
+      } else {
+        memcpy(p_peer->codec_config, imposed, sizeof(imposed));
+        p_peer->p_sink = previous_sink;
+        log::info("QTI offload: retaining peer {} configuration for software fallback", p_peer->addr);
+      }
+    }
     if (p_peer->p_sink == nullptr) {
       // Update the selected codec
       p_peer->p_sink = peer_cache_->FindPeerSink(
@@ -566,6 +597,10 @@ void BtaAvCo::ProcessSetConfig(tBTA_AV_HNDL bta_av_handle, const RawAddress& pee
       if (status == A2DP_SUCCESS &&
           num_protect == 1 &&
           !p_peer->ContentProtectActive()) {
+        reconfig_needed = true;
+      }
+      if (status == A2DP_SUCCESS && qti_rate_reconfig_needed(
+              p_codec_info, p_peer->GetCodecs()->getCurrentCodecConfig())) {
         reconfig_needed = true;
       }
     }
